@@ -1,0 +1,26 @@
+# TPU v5e-8 optimized config
+# 8 TPU chips = batch should be divisible by 8
+# Larger batches = better TPU utilization
+
+train_cfg:
+  lr: 5.0e-4
+  epochs: 40
+  batch_size: 128  # 128 / 8 = 16 per TPU chip (good utilization)
+  
+  warmup_epochs: 5
+  warmup_steps: 500  # LR warmup steps
+  fusion_alpha_warm: 0.8
+  hard_negative_start_epoch: 30
+
+  use_ranking_loss: true
+  ranking_margin: 0.2
+  ranking_weight_phaseB: 0.3
+  ranking_weight_phaseC: 0.5
+
+model_cfg:
+  input_size: 320
+  fusion_alpha: 0.4
+  global_hidden_dim: 512
+  transformer_layers: 6
+  transformer_heads: 8
+

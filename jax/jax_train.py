@@ -1,7 +1,10 @@
 # jax_train.py
+# Optimized for TPU v5e-8 on Kaggle
 import argparse
 import os
 import time
+import functools
+from typing import Any
 
 import jax
 import jax.numpy as jnp
@@ -10,12 +13,33 @@ import optax
 import yaml
 from flax.training import train_state, checkpoints
 from flax import jax_utils
+from flax.jax_utils import prefetch_to_device
 
 from jax_models import JIPNetFullFlax
 from jax_data import read_pair_list, pair_generator
 
 
-# ---------- Losses ----------
+# ---------- TPU/Device Setup ----------
+
+def setup_device():
+    """Setup JAX for TPU/GPU/CPU with proper configuration."""
+    # Print device info
+    devices = jax.devices()
+    n_devices = len(devices)
+    device_kind = devices[0].device_kind if devices else "unknown"
+    
+    print(f"JAX devices: {n_devices} x {device_kind}")
+    print(f"Devices: {devices}")
+    
+    # Check if TPU
+    is_tpu = "TPU" in device_kind.upper()
+    if is_tpu:
+        print("✓ Running on TPU - using bfloat16 for optimal performance")
+    
+    return n_devices, is_tpu
+
+
+# ---------- Losses (with bfloat16 support) ----------
 
 def binary_focal_loss(pred: jnp.ndarray,
                       target: jnp.ndarray,
@@ -26,6 +50,10 @@ def binary_focal_loss(pred: jnp.ndarray,
     pred: [B,1] in [0,1]
     target: [B,1] in {0,1}
     """
+    # Cast to float32 for loss computation (numerical stability)
+    pred = pred.astype(jnp.float32)
+    target = target.astype(jnp.float32)
+    
     p_t = target * pred + (1.0 - target) * (1.0 - pred)
     focal = -alpha * (1.0 - p_t) ** gamma * jnp.log(p_t + eps)
     return jnp.mean(focal)
@@ -36,15 +64,14 @@ def inbatch_ranking_loss(score: jnp.ndarray,
                          margin: float = 0.2,
                          key: jax.random.KeyArray = None) -> jnp.ndarray:
     """
-    Random in-batch ranking loss:
-      mỗi positive so với 1 negative random trong batch (per-device batch).
-    score: [B,1], target: [B,1]
+    Random in-batch ranking loss.
     """
     if key is None:
         key = jax.random.PRNGKey(0)
 
-    score = score.squeeze(-1)
-    target = target.squeeze(-1)
+    # Cast to float32 for loss computation
+    score = score.astype(jnp.float32).squeeze(-1)
+    target = target.astype(jnp.float32).squeeze(-1)
 
     pos_mask = (target == 1.0)
     neg_mask = (target == 0.0)
@@ -56,8 +83,8 @@ def inbatch_ranking_loss(score: jnp.ndarray,
         return jnp.array(0.0, dtype=jnp.float32)
 
     def _compute():
-        pos_scores = score[pos_mask]  # [Np]
-        neg_scores = score[neg_mask]  # [Nn]
+        pos_scores = score[pos_mask]
+        neg_scores = score[neg_mask]
         idx = jax.random.randint(key, (pos_scores.shape[0],),
                                  minval=0, maxval=neg_scores.shape[0])
         neg_sampled = neg_scores[idx]
@@ -74,19 +101,26 @@ class TrainState(train_state.TrainState):
     pass
 
 
-def create_train_state(rng, config):
+def create_train_state(rng, config, is_tpu=False):
+    """Create train state with optional bfloat16 for TPU."""
+    
+    # Determine dtype based on device
+    param_dtype = jnp.bfloat16 if is_tpu else jnp.float32
+    
     model = JIPNetFullFlax(
         input_size=config["model_cfg"]["input_size"],
         global_hidden_dim=config["model_cfg"]["global_hidden_dim"],
         transformer_layers=config["model_cfg"]["transformer_layers"],
         transformer_heads=config["model_cfg"]["transformer_heads"],
+        dtype=param_dtype,
     )
+    
     dummy = jnp.zeros(
         (1,
          config["model_cfg"]["input_size"],
          config["model_cfg"]["input_size"],
          1),
-        dtype=jnp.float32
+        dtype=param_dtype
     )
 
     variables = model.init(
@@ -95,7 +129,22 @@ def create_train_state(rng, config):
     )
     params = variables["params"]
 
-    tx = optax.adamw(config["train_cfg"]["lr"])
+    # Use learning rate schedule with warmup
+    lr = config["train_cfg"]["lr"]
+    warmup_steps = config["train_cfg"].get("warmup_steps", 1000)
+    
+    schedule = optax.warmup_cosine_decay_schedule(
+        init_value=0.0,
+        peak_value=lr,
+        warmup_steps=warmup_steps,
+        decay_steps=config["train_cfg"]["epochs"] * 1000,  # Approximate
+        end_value=lr * 0.01,
+    )
+    
+    tx = optax.chain(
+        optax.clip_by_global_norm(1.0),  # Gradient clipping for stability
+        optax.adamw(schedule, weight_decay=0.01),
+    )
 
     return TrainState.create(
         apply_fn=model.apply,
@@ -110,15 +159,41 @@ def shard_batch(batch, n_devices):
     """[B,...] -> [n_devices, B/n_devices, ...]"""
     def _shard(x):
         B = x.shape[0]
-        assert B % n_devices == 0, \
-            f"Global batch {B} must be divisible by n_devices {n_devices}"
+        if B % n_devices != 0:
+            # Pad batch to be divisible
+            pad_size = n_devices - (B % n_devices)
+            x = jnp.concatenate([x, jnp.zeros((pad_size,) + x.shape[1:], dtype=x.dtype)], axis=0)
+            B = x.shape[0]
         return x.reshape((n_devices, B // n_devices) + x.shape[1:])
     return {k: _shard(v) for k, v in batch.items()}
 
 
-def make_train_step(config):
+def data_iterator_with_prefetch(data_gen, n_devices, prefetch_size=2, is_tpu=False):
+    """
+    Create a prefetching data iterator for efficient TPU/GPU utilization.
+    Converts data to appropriate dtype and shards across devices.
+    """
+    dtype = jnp.bfloat16 if is_tpu else jnp.float32
+    
+    def prepare_batch(batch_np):
+        batch = {k: jnp.array(v, dtype=dtype) for k, v in batch_np.items()}
+        # Keep target as float32 for loss computation
+        batch["target"] = jnp.array(batch_np["target"], dtype=jnp.float32)
+        return shard_batch(batch, n_devices)
+    
+    def gen():
+        for batch_np in data_gen:
+            yield prepare_batch(batch_np)
+    
+    # Prefetch to device for better overlap
+    return prefetch_to_device(gen(), prefetch_size)
 
+
+def make_train_step(config, is_tpu=False):
+    """Create pmapped train step function."""
+    
     margin = config["train_cfg"]["ranking_margin"]
+    dtype = jnp.bfloat16 if is_tpu else jnp.float32
 
     def train_step(state: TrainState,
                    batch: dict,
@@ -126,8 +201,7 @@ def make_train_step(config):
                    ranking_weight: float,
                    rng: jax.random.KeyArray):
         """
-        train_step chạy trên 1 device (per-device batch).
-        pmap sẽ wrap ngoài.
+        Single train step running on each device.
         """
 
         def loss_fn(params):
@@ -136,6 +210,7 @@ def make_train_step(config):
                                    batch["mask1"], batch["mask2"],
                                    fusion_alpha)
 
+            # Compute losses in float32 for stability
             focal = binary_focal_loss(score, batch["target"])
             rank = inbatch_ranking_loss(score, batch["target"],
                                         margin=margin, key=rng)
@@ -145,12 +220,12 @@ def make_train_step(config):
         grad_fn = jax.value_and_grad(loss_fn, has_aux=True)
         (loss, (focal, rank, score)), grads = grad_fn(state.params)
 
-        # average grads/metrics over devices
+        # Average grads/metrics over devices
         grads = jax.lax.pmean(grads, axis_name="dev")
         loss = jax.lax.pmean(loss, axis_name="dev")
         focal = jax.lax.pmean(focal, axis_name="dev")
         rank = jax.lax.pmean(rank, axis_name="dev")
-        score_mean = jax.lax.pmean(jnp.mean(score), axis_name="dev")
+        score_mean = jax.lax.pmean(jnp.mean(score.astype(jnp.float32)), axis_name="dev")
 
         state = state.apply_gradients(grads=grads)
 
@@ -162,7 +237,8 @@ def make_train_step(config):
         }
         return state, metrics
 
-    return jax.pmap(train_step, axis_name="dev")  # ✅ multi-device
+    # donate_argnums=(0,) tells JAX it can reuse the memory of state
+    return jax.pmap(train_step, axis_name="dev", donate_argnums=(0,))
 
 
 def parse_args():
@@ -191,6 +267,9 @@ def parse_args():
 def main():
     args = parse_args()
 
+    # Setup devices (TPU/GPU/CPU)
+    n_devices, is_tpu = setup_device()
+
     # Initialize wandb if requested
     wandb_run = None
     if args.use_wandb:
@@ -199,7 +278,7 @@ def main():
             wandb_run = wandb.init(
                 project=args.wandb_project,
                 name=args.wandb_run_name,
-                config={"args": vars(args)}
+                config={"args": vars(args), "is_tpu": is_tpu, "n_devices": n_devices}
             )
             print(f"Wandb initialized: {wandb_run.url}")
         except ImportError:
@@ -209,37 +288,32 @@ def main():
     with open(args.config, "r") as f:
         config = yaml.safe_load(f)
 
+    # Adjust batch size for TPU (should be divisible by n_devices)
+    global_batch = config["train_cfg"]["batch_size"]
+    if global_batch % n_devices != 0:
+        new_batch = (global_batch // n_devices + 1) * n_devices
+        print(f"Adjusting batch_size from {global_batch} to {new_batch} for {n_devices} devices")
+        config["train_cfg"]["batch_size"] = new_batch
+        global_batch = new_batch
+
+    per_device_batch = global_batch // n_devices
+    print(f"Global batch: {global_batch}, Per-device batch: {per_device_batch}")
+
     # Log config to wandb
     if wandb_run:
         wandb_run.config.update(config)
+        wandb_run.config.update({"per_device_batch": per_device_batch})
 
     os.makedirs(args.output_dir, exist_ok=True)
 
-    n_devices = jax.device_count()
-    print("JAX devices:", n_devices, jax.devices())
-
-    # init state, then replicate to all devices
+    # Create train state with TPU optimization
     rng = jax.random.PRNGKey(0)
-    state = create_train_state(rng, config)
-    state = jax_utils.replicate(state)  # ✅ replicate params/opt state
+    state = create_train_state(rng, config, is_tpu=is_tpu)
+    state = jax_utils.replicate(state)
 
-    # data
+    # Load data
     train_info = read_pair_list(args.train_npy)
     print(f"Loaded {len(train_info)} training pairs")
-
-    global_batch = config["train_cfg"]["batch_size"]
-    assert global_batch % n_devices == 0, \
-        f"batch_size {global_batch} must be divisible by {n_devices}"
-
-    train_gen = pair_generator(
-        train_info,
-        batch_size=global_batch,
-        input_size=config["model_cfg"]["input_size"],
-        use_augmentation=True,
-        use_mask=True,
-        shuffle=True,
-        data_root=args.data_root,
-    )
 
     num_epochs = config["train_cfg"]["epochs"]
     steps_per_epoch = len(train_info) // global_batch
@@ -252,14 +326,22 @@ def main():
     wB = config["train_cfg"]["ranking_weight_phaseB"]
     wC = config["train_cfg"]["ranking_weight_phaseC"]
 
-    p_train_step = make_train_step(config)
+    # Create pmapped train step
+    p_train_step = make_train_step(config, is_tpu=is_tpu)
 
     rng = jax.random.PRNGKey(42)
 
-    print(f"\nStarting training for {num_epochs} epochs, {steps_per_epoch} steps/epoch")
+    print(f"\n{'='*60}")
+    print(f"Starting training for {num_epochs} epochs, {steps_per_epoch} steps/epoch")
+    print(f"Using {'bfloat16' if is_tpu else 'float32'} precision")
+    print(f"{'='*60}\n")
+
+    total_start_time = time.time()
 
     for epoch in range(num_epochs):
-        # phase schedule
+        epoch_start_time = time.time()
+        
+        # Phase schedule
         if epoch < warmup_epochs:
             phase = "A_warmup"
             fusion_alpha = fusion_alpha_warm
@@ -276,48 +358,76 @@ def main():
         print(f"\nEpoch {epoch}/{num_epochs} phase={phase} "
               f"alpha={fusion_alpha:.2f} rank_w={rank_w:.2f}")
 
+        # Create fresh data generator for each epoch
+        train_gen = pair_generator(
+            train_info,
+            batch_size=global_batch,
+            input_size=config["model_cfg"]["input_size"],
+            use_augmentation=True,
+            use_mask=True,
+            shuffle=True,
+            data_root=args.data_root,
+        )
+
         epoch_loss = 0.0
         epoch_focal = 0.0
         epoch_rank = 0.0
+        step_times = []
 
         for step in range(steps_per_epoch):
+            step_start = time.time()
+            
+            # Get batch and prepare for devices
             batch_np = next(train_gen)
-            batch = {k: jnp.array(v) for k, v in batch_np.items()}
-            batch = shard_batch(batch, n_devices)  # ✅ shard for pmap
+            dtype = jnp.bfloat16 if is_tpu else jnp.float32
+            batch = {k: jnp.array(v, dtype=dtype) for k, v in batch_np.items()}
+            batch["target"] = jnp.array(batch_np["target"], dtype=jnp.float32)
+            batch = shard_batch(batch, n_devices)
 
             rng, step_key = jax.random.split(rng)
-            # per-device rng: [n_devices, 2]
             step_keys = jax.random.split(step_key, n_devices)
 
             state, metrics = p_train_step(state, batch,
                                           fusion_alpha, rank_w,
                                           step_keys)
 
-            # metrics is replicated; take from device 0
-            m0 = jax.tree_util.tree_map(lambda x: x[0], metrics)
-            epoch_loss += float(m0["loss"]) / steps_per_epoch
-            epoch_focal += float(m0["focal"]) / steps_per_epoch
-            epoch_rank += float(m0["rank"]) / steps_per_epoch
+            # Block until computation is done (for accurate timing)
+            jax.tree_util.tree_map(lambda x: x.block_until_ready(), metrics)
+            
+            step_time = time.time() - step_start
+            step_times.append(step_time)
+
+            # Get metrics from device 0
+            m0 = jax.tree_util.tree_map(lambda x: float(x[0]), metrics)
+            epoch_loss += m0["loss"] / steps_per_epoch
+            epoch_focal += m0["focal"] / steps_per_epoch
+            epoch_rank += m0["rank"] / steps_per_epoch
 
             if (step + 1) % 50 == 0:
+                avg_step_time = np.mean(step_times[-50:])
+                samples_per_sec = global_batch / avg_step_time
                 print(f"  step {step+1}/{steps_per_epoch} "
                       f"loss={m0['loss']:.4f} focal={m0['focal']:.4f} "
-                      f"rank={m0['rank']:.4f}")
+                      f"rank={m0['rank']:.4f} "
+                      f"({samples_per_sec:.1f} samples/sec)")
                 
-                # Log step metrics to wandb
                 if wandb_run:
                     wandb_run.log({
                         "step": epoch * steps_per_epoch + step,
-                        "step_loss": float(m0["loss"]),
-                        "step_focal": float(m0["focal"]),
-                        "step_rank": float(m0["rank"]),
-                        "step_score_mean": float(m0["score_mean"]),
+                        "step_loss": m0["loss"],
+                        "step_focal": m0["focal"],
+                        "step_rank": m0["rank"],
+                        "step_score_mean": m0["score_mean"],
+                        "samples_per_sec": samples_per_sec,
                     })
 
+        epoch_time = time.time() - epoch_start_time
+        avg_step_time = np.mean(step_times)
+        
         print(f"Epoch {epoch} DONE: loss={epoch_loss:.4f} "
-              f"focal={epoch_focal:.4f} rank={epoch_rank:.4f}")
+              f"focal={epoch_focal:.4f} rank={epoch_rank:.4f} "
+              f"({epoch_time:.1f}s, {global_batch/avg_step_time:.1f} samples/sec avg)")
 
-        # Log epoch metrics to wandb
         if wandb_run:
             wandb_run.log({
                 "epoch": epoch,
@@ -327,18 +437,22 @@ def main():
                 "phase": phase,
                 "fusion_alpha": fusion_alpha,
                 "rank_weight": rank_w,
+                "epoch_time": epoch_time,
             })
 
-        # save checkpoint (unreplicate first)
+        # Save checkpoint
         params_cpu = jax.device_get(jax_utils.unreplicate(state).params)
         checkpoints.save_checkpoint(args.output_dir,
                                     target=params_cpu,
                                     step=epoch,
                                     overwrite=True)
 
-    print("Training finished.")
+    total_time = time.time() - total_start_time
+    print(f"\n{'='*60}")
+    print(f"Training finished in {total_time/60:.1f} minutes")
+    print(f"{'='*60}")
 
-    # final save
+    # Final save
     params_cpu = jax.device_get(jax_utils.unreplicate(state).params)
     checkpoints.save_checkpoint(args.output_dir,
                                 target=params_cpu,
@@ -346,6 +460,7 @@ def main():
                                 overwrite=True)
 
     if wandb_run:
+        wandb_run.log({"total_training_time_minutes": total_time / 60})
         wandb_run.finish()
 
 
