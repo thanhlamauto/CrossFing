@@ -8,3 +8,7 @@ skimage==0.0
 timm==0.9.12
 torch==2.1.2
 tqdm==4.66.1
+jax>=0.4.0
+jaxlib>=0.4.0
+flax>=0.7.0
+optax>=0.1.0

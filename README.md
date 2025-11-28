@@ -17,7 +17,6 @@
 
 # Joint Identity Verification and Pose Alignment for Partial Fingerprints
 
-<h5 align="left"> If our project helps you, please give us a star ⭐ on GitHub to support us. 🙏🙏 </h2>
 
 <br>
 
@@ -29,7 +28,7 @@
 ### 💬 This repo is the official implementation of:
 - ***TIFS 2025***: [Joint Identity Verification and Pose Alignment for Partial Fingerprints](https://arxiv.org/abs/2405.03959) 
 
-[Xiongjun Guan](https://xiongjunguan.github.io/), Zhiyu Pan, Jianjiang Feng, Jie Zhou
+Xiongjun Guan, Zhiyu Pan, Jianjiang Feng, Jie Zhou
 
 <br>
 
@@ -104,7 +103,6 @@ python train_JIPNet.py
 :triangular_flag_on_post: The pretrained encoder is uploaded at `./JIPNet/encoder_bath.pth` in this [link](https://drive.google.com/drive/folders/1q9yopPjOFt9c9odCT1o4nheLvwrJaCu7?usp=sharing).
 
 If you are interested in this part, you can refer to our other repository for training fingerprint enhancement networks.
-https://github.com/XiongjunGuan/FpEnhancer
 
 Note that the network of above repository‌ has been adjusted, and its weight cannot be directly applied to JIPNet.
 
@@ -185,7 +183,7 @@ The test data (part) is available from this [link](https://drive.google.com/driv
 
 
 ## Citation
-If you find this repository useful, please give us stars and use the following BibTeX entry for citation.
+If you find this repository useful, please use the following BibTeX entry for citation.
 ```
 @ARTICLE{guan2024joint,
   author={Guan, Xiongjun and Pan, Zhiyu and Feng, Jianjiang and Zhou, Jie},

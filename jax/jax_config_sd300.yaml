@@ -1,0 +1,20 @@
+train_cfg:
+  lr: 5.0e-4
+  epochs: 40
+  batch_size: 64
+
+  warmup_epochs: 5
+  fusion_alpha_warm: 0.8
+  hard_negative_start_epoch: 30
+
+  use_ranking_loss: true
+  ranking_margin: 0.2
+  ranking_weight_phaseB: 0.3
+  ranking_weight_phaseC: 0.5
+
+model_cfg:
+  input_size: 320
+  fusion_alpha: 0.4
+  global_hidden_dim: 512
+  transformer_layers: 6
+  transformer_heads: 8
