@@ -709,6 +709,68 @@ def main():
                                     step=epoch,
                                     overwrite=True)
 
+        # Validation after each epoch
+        if args.valid_npy and os.path.exists(args.valid_npy):
+            print(f"\n[Validation] Epoch {epoch} - Evaluating on {args.valid_npy}")
+            valid_far_list = [0.1, 0.01, 0.001, 0.0001]
+            
+            # Use current state directly (no need to reload from checkpoint)
+            valid_info = read_pair_list(args.valid_npy)
+            valid_gen = pair_generator(
+                valid_info,
+                batch_size=global_batch,
+                input_size=config["model_cfg"]["input_size"],
+                use_augmentation=False,
+                use_mask=True,
+                shuffle=False,
+                data_root=args.data_root,
+            )
+            
+            valid_steps = len(valid_info) // global_batch + int(len(valid_info) % global_batch > 0)
+            valid_scores, valid_targets = [], []
+            
+            # Create inference function
+            @jax.pmap
+            def infer_valid(params, batch):
+                score = state.apply_fn({"params": params},
+                                      batch["img1"], batch["img2"],
+                                      batch["mask1"], batch["mask2"],
+                                      fusion_alpha_norm)
+                return score
+            
+            for _ in range(valid_steps):
+                batch_np = next(valid_gen)
+                dtype = jnp.bfloat16 if is_tpu else jnp.float32
+                batch = {k: jnp.array(v, dtype=dtype) for k, v in batch_np.items()}
+                batch["target"] = jnp.array(batch_np["target"], dtype=jnp.float32)
+                batch = shard_batch(batch, n_devices)
+                
+                score = infer_valid(state.params, batch)
+                score = np.array(score).reshape(-1)
+                valid_scores.append(score)
+                valid_targets.append(batch_np["target"].reshape(-1))
+            
+            valid_scores_all = np.concatenate(valid_scores, axis=0)
+            valid_targets_all = np.concatenate(valid_targets, axis=0)
+            
+            # Compute TAR@FAR
+            valid_results = tar_at_far(valid_scores_all, valid_targets_all, valid_far_list)
+            
+            print(f"[Validation] Epoch {epoch} TAR@FAR:")
+            for FAR, thr, TAR in valid_results:
+                if thr is None:
+                    print(f"  FAR={FAR:.4f}: not enough negatives")
+                else:
+                    print(f"  FAR={FAR:.4f}: thr={thr:.4f}, TAR={TAR:.4f}")
+            
+            # Log to wandb
+            if wandb_run:
+                valid_log = {"epoch": epoch}
+                for FAR, thr, TAR in valid_results:
+                    if TAR is not None:
+                        valid_log[f"valid_TAR@FAR_{FAR:.4f}"] = TAR
+                wandb_run.log(valid_log)
+
     total_time = time.time() - total_start_time
     print(f"\n{'='*60}")
     print(f"Training finished in {total_time/60:.1f} minutes")
