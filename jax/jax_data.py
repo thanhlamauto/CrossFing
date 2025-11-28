@@ -11,7 +11,17 @@ def read_pair_list(npy_path: str) -> List[str]:
     """
     Giống train.npy/valid.npy của JIPNet: np.load(...).item()['info_lst'].
     """
+    if not os.path.exists(npy_path):
+        raise FileNotFoundError(
+            f"Data file not found: {npy_path}\n"
+            f"Please check that the dataset is mounted and the path is correct."
+        )
     data = np.load(npy_path, allow_pickle=True).item()
+    if "info_lst" not in data:
+        raise KeyError(
+            f"Expected 'info_lst' key in {npy_path}. "
+            f"Available keys: {list(data.keys())}"
+        )
     return data["info_lst"]
 
 
