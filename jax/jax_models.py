@@ -204,7 +204,7 @@ class CrossAttentionBlock(nn.Module):
             deterministic=True,
             dtype=self.dtype,
             param_dtype=self.dtype,
-        )(y_q, y_kv, bias=bias)
+        )(y_q, y_kv, attention_bias=bias)
 
         x_q = x_q + y
         x_q = x_q + MLPBlock(hidden_dim=4 * x_q.shape[-1], dtype=self.dtype)(
