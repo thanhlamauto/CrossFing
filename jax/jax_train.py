@@ -282,7 +282,9 @@ def make_train_step(config, is_tpu=False):
         return state, metrics
 
     # donate_argnums=(0,) tells JAX it can reuse the memory of state
-    return jax.pmap(train_step, axis_name="dev", donate_argnums=(0,))
+    # static_broadcasted_argnums marks scalar arguments that don't need to be mapped
+    return jax.pmap(train_step, axis_name="dev", donate_argnums=(0,), 
+                    static_broadcasted_argnums=(2, 3))  # fusion_alpha and ranking_weight are static
 
 
 def parse_args():
