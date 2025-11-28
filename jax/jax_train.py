@@ -169,6 +169,162 @@ def inbatch_ranking_loss(score: jnp.ndarray,
     return avg_loss * has_both.astype(jnp.float32)
 
 
+# ---------- Eval helpers ----------
+
+def tar_at_far(scores, targets, far_list):
+    scores = np.asarray(scores)
+    targets = np.asarray(targets)
+    pos = scores[targets == 1.0]
+    neg = scores[targets == 0.0]
+
+    neg_sorted = np.sort(neg)[::-1]
+    results = []
+    for FAR in far_list:
+        idx = int(FAR * len(neg_sorted))
+        if idx >= len(neg_sorted) or len(neg_sorted) == 0:
+            results.append((FAR, None, None))
+            continue
+        thr = neg_sorted[idx]
+        TAR = np.mean(pos >= thr) if len(pos) > 0 else None
+        results.append((FAR, thr, TAR))
+    return results
+
+
+def compute_eer(scores, targets):
+    scores = np.asarray(scores)
+    targets = np.asarray(targets)
+    pos = scores[targets == 1.0]
+    neg = scores[targets == 0.0]
+
+    if len(pos) == 0 or len(neg) == 0:
+        return None, None
+
+    thresholds = np.sort(np.unique(scores))
+    best_eer = None
+    best_thr = None
+    min_diff = float("inf")
+
+    for thr in thresholds:
+        far = np.mean(neg >= thr)
+        frr = np.mean(pos < thr)
+        diff = abs(far - frr)
+        if diff < min_diff:
+            min_diff = diff
+            best_eer = 0.5 * (far + frr)
+            best_thr = thr
+
+    return best_eer, best_thr
+
+
+def evaluate_checkpoint(cfg,
+                        ckpt_dir: str,
+                        test_npy: str,
+                        data_root: str,
+                        global_batch: int = 64,
+                        far_list=None):
+    """Minimal eval pass used at the end of training."""
+    far_list = far_list or [1e-1, 1e-2, 1e-3, 1e-4]
+    if not test_npy:
+        return
+    if not os.path.exists(test_npy):
+        print(f"[Eval] Skipping evaluation because {test_npy} was not found.")
+        return
+
+    print(f"\n[Eval] Running evaluation on {test_npy}")
+    n_devices = jax.device_count()
+    print("[Eval] Devices:", jax.devices())
+
+    model = JIPNetFullFlax(
+        input_size=cfg["model_cfg"]["input_size"],
+        global_hidden_dim=cfg["model_cfg"]["global_hidden_dim"],
+        transformer_layers=cfg["model_cfg"]["transformer_layers"],
+        transformer_heads=cfg["model_cfg"]["transformer_heads"],
+    )
+    dummy = jnp.zeros(
+        (1,
+         cfg["model_cfg"]["input_size"],
+         cfg["model_cfg"]["input_size"],
+         1),
+        dtype=jnp.float32
+    )
+    variables = model.init(jax.random.PRNGKey(0),
+                           dummy, dummy, dummy, dummy,
+                           cfg["model_cfg"]["fusion_alpha"])
+    params = variables["params"]
+
+    restore_path = ckpt_dir
+    if not os.path.isdir(restore_path):
+        restore_path = os.path.dirname(restore_path)
+    print(f"[Eval] Restoring checkpoint from {restore_path}")
+    params = checkpoints.restore_checkpoint(restore_path, target=params)
+    params = jax_utils.replicate(params)
+
+    @jax.pmap
+    def infer(params, batch):
+        score = model.apply({"params": params},
+                            batch["img1"], batch["img2"],
+                            batch["mask1"], batch["mask2"],
+                            cfg["model_cfg"]["fusion_alpha"])
+        return score
+
+    test_info = read_pair_list(test_npy)
+    print(f"[Eval] Loaded {len(test_info)} pairs")
+
+    if global_batch % n_devices != 0:
+        global_batch = n_devices * max(1, global_batch // n_devices)
+    print(f"[Eval] Global batch {global_batch} (per-device {global_batch // n_devices})")
+
+    gen = pair_generator(
+        test_info,
+        batch_size=global_batch,
+        input_size=cfg["model_cfg"]["input_size"],
+        use_augmentation=False,
+        use_mask=True,
+        shuffle=False,
+        data_root=data_root,
+    )
+
+    steps = len(test_info) // global_batch + int(len(test_info) % global_batch > 0)
+    all_scores, all_targets = [], []
+
+    total_infer_time = 0.0
+    total_samples = 0
+
+    for _ in range(steps):
+        batch_np = next(gen)
+        batch = {k: jnp.array(v) for k, v in batch_np.items()}
+        batch = shard_batch(batch, n_devices)
+        batch_start = time.time()
+        score = infer(params, batch)
+        score = np.array(score).reshape(-1)
+        batch_time = time.time() - batch_start
+        total_infer_time += batch_time
+        all_scores.append(score)
+        all_targets.append(batch_np["target"].reshape(-1))
+        total_samples += batch_np["target"].shape[0]
+
+    scores = np.concatenate(all_scores, axis=0)
+    targets = np.concatenate(all_targets, axis=0)
+    results = tar_at_far(scores, targets, far_list)
+    eer, eer_thr = compute_eer(scores, targets)
+
+    print("[Eval] TAR@FAR results:")
+    for FAR, thr, TAR in results:
+        if thr is None:
+            print(f"  FAR={FAR:.1e}: not enough negatives")
+        else:
+            print(f"  FAR={FAR:.1e}: thr={thr:.4f}, TAR={TAR:.4f}")
+
+    if eer is None:
+        print("[Eval] EER: not enough positive/negative samples")
+    else:
+        print(f"[Eval] EER: {eer*100:.2f}% at thr={eer_thr:.4f}")
+
+    if total_infer_time > 0 and total_samples > 0:
+        print(f"[Eval] Inference time: {total_infer_time:.2f}s total "
+              f"({total_samples/total_infer_time:.2f} samples/sec)")
+
+
 # ---------- TrainState ----------
 
 class TrainState(train_state.TrainState):
@@ -564,6 +720,14 @@ def main():
                                 target=params_cpu,
                                 step=num_epochs,
                                 overwrite=True)
+
+    if args.valid_npy:
+        final_ckpt_dir = os.path.join(args.output_dir, f"checkpoint_{num_epochs}")
+        evaluate_checkpoint(cfg=config,
+                            ckpt_dir=final_ckpt_dir,
+                            test_npy=args.valid_npy,
+                            data_root=args.data_root,
+                            global_batch=config["train_cfg"]["batch_size"])
 
     if wandb_run:
         wandb_run.log({"total_training_time_minutes": total_time / 60})

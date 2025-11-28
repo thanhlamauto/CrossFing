@@ -4,13 +4,13 @@
 
 train_cfg:
   lr: 5.0e-4
-  epochs: 40
+  epochs: 60
   batch_size: 128  # 128 / 8 = 16 per TPU chip (good utilization)
   
   warmup_epochs: 5
   warmup_steps: 500  # LR warmup steps
   fusion_alpha_warm: 0.8
-  hard_negative_start_epoch: 30
+  hard_negative_start_epoch: 45
 
   use_ranking_loss: true
   ranking_margin: 0.2

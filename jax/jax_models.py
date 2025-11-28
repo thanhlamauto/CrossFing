@@ -187,24 +187,30 @@ class CrossAttentionBlock(nn.Module):
     dtype: Dtype = jnp.float32
 
     @nn.compact
-    def __call__(self, x_q, x_kv):
+    def __call__(self, x_q, x_kv, mask_k=None):
         # x_q: [B,Nq,C], x_kv: [B,Nk,C]
         y_q = nn.LayerNorm(dtype=self.dtype, param_dtype=jnp.float32)(x_q)
         y_kv = nn.LayerNorm(dtype=self.dtype, param_dtype=jnp.float32)(x_kv)
+
+        bias = None
+        if mask_k is not None:
+            mask_k = mask_k.astype(jnp.float32)
+            large_neg = -1e4
+            bias = (1.0 - mask_k) * large_neg  # [B,Nk]
+            bias = bias[:, None, None, :]  # [B,1,1,Nk]
 
         y = nn.MultiHeadDotProductAttention(
             num_heads=self.num_heads,
             deterministic=True,
             dtype=self.dtype,
             param_dtype=self.dtype,
-        )(y_q, y_kv)
+        )(y_q, y_kv, bias=bias)
 
         x_q = x_q + y
         x_q = x_q + MLPBlock(hidden_dim=4 * x_q.shape[-1], dtype=self.dtype)(
             nn.LayerNorm(dtype=self.dtype, param_dtype=jnp.float32)(x_q)
         )
         return x_q
-
 
 class PairTransformer(nn.Module):
     embed_dim: int
@@ -213,25 +219,52 @@ class PairTransformer(nn.Module):
     dtype: Dtype = jnp.float32
 
     @nn.compact
-    def __call__(self, f0, f1):
+    def __call__(self, f0, f1, mask0=None, mask1=None):
         """
         f0, f1: [B,H,W,C]
+        mask0, mask1: [B,H,W,1] in {0,1}
         Return: logits [B,1]
         """
         B, H, W, C = f0.shape
         x0 = jnp.reshape(f0, (B, H * W, C))
         x1 = jnp.reshape(f1, (B, H * W, C))
 
-        for i in range(self.num_layers):
-            # Use gradient checkpointing for memory efficiency on TPU
-            # (recompute activations during backward pass)
+        mask0_flat = None
+        mask1_flat = None
+        if mask0 is not None:
+            mask0_flat = jnp.reshape(mask0, (B, H * W))
+        if mask1 is not None:
+            mask1_flat = jnp.reshape(mask1, (B, H * W))
+
+        for _ in range(self.num_layers):
+            if mask0_flat is not None:
+                x0 = x0 * mask0_flat[:, :, None]
+            if mask1_flat is not None:
+                x1 = x1 * mask1_flat[:, :, None]
+
             x0 = SelfAttentionBlock(self.num_heads, dtype=self.dtype)(x0)
             x1 = SelfAttentionBlock(self.num_heads, dtype=self.dtype)(x1)
-            x0 = CrossAttentionBlock(self.num_heads, dtype=self.dtype)(x0, x1)
-            x1 = CrossAttentionBlock(self.num_heads, dtype=self.dtype)(x1, x0)
 
-        x0_mean = jnp.mean(x0, axis=1)
-        x1_mean = jnp.mean(x1, axis=1)
+            if mask0_flat is not None:
+                x0 = x0 * mask0_flat[:, :, None]
+            if mask1_flat is not None:
+                x1 = x1 * mask1_flat[:, :, None]
+
+            x0 = CrossAttentionBlock(self.num_heads, dtype=self.dtype)(x0, x1, mask_k=mask1_flat)
+            x1 = CrossAttentionBlock(self.num_heads, dtype=self.dtype)(x1, x0, mask_k=mask0_flat)
+
+        def masked_mean(x, m):
+            m_exp = m[:, :, None]
+            sum_val = jnp.sum(x * m_exp, axis=1)
+            denom = jnp.sum(m_exp, axis=1) + 1e-6
+            return sum_val / denom
+
+        if mask0_flat is not None and mask1_flat is not None:
+            x0_mean = masked_mean(x0, mask0_flat)
+            x1_mean = masked_mean(x1, mask1_flat)
+        else:
+            x0_mean = jnp.mean(x0, axis=1)
+            x1_mean = jnp.mean(x1, axis=1)
 
         h = jnp.concatenate(
             [x0_mean, x1_mean, jnp.abs(x0_mean - x1_mean)],
@@ -300,7 +333,7 @@ class JIPNetFullFlax(nn.Module):
                                       num_heads=self.transformer_heads,
                                       num_layers=self.transformer_layers,
                                       dtype=self.dtype)
-        logits_ca = transformer(f1, f2)
+        logits_ca = transformer(f1, f2, mask0=mask1_res, mask1=mask2_res)
         
         # Sigmoid in float32 for numerical stability
         score_ca = jax.nn.sigmoid(logits_ca.astype(jnp.float32))

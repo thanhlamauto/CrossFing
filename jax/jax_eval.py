@@ -2,6 +2,7 @@
 import argparse
 import os
 import sys
+import time
 
 # Add current directory to path for imports
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -73,6 +74,32 @@ def tar_at_far(scores, targets, far_list=(1e-1, 1e-2, 1e-3, 1e-4)):
         TAR = np.mean(pos >= thr) if len(pos) > 0 else None
         results.append((FAR, thr, TAR))
     return results
+
+
+def compute_eer(scores, targets):
+    scores = np.asarray(scores)
+    targets = np.asarray(targets)
+    pos = scores[targets == 1.0]
+    neg = scores[targets == 0.0]
+
+    if len(pos) == 0 or len(neg) == 0:
+        return None, None
+
+    thresholds = np.sort(np.unique(scores))
+    best_eer = None
+    best_thr = None
+    min_diff = float("inf")
+
+    for thr in thresholds:
+        far = np.mean(neg >= thr)
+        frr = np.mean(pos < thr)
+        diff = abs(far - frr)
+        if diff < min_diff:
+            min_diff = diff
+            best_eer = 0.5 * (far + frr)
+            best_thr = thr
+
+    return best_eer, best_thr
 
 
 def main():
@@ -147,6 +174,9 @@ def main():
 
     all_scores, all_targets = [], []
 
+    total_infer_time = 0.0
+    total_samples = 0
+
     for i in range(steps):
         if args.max_batches is not None and i >= args.max_batches:
             break
@@ -155,16 +185,21 @@ def main():
         batch = {k: jnp.array(v) for k, v in batch_np.items()}
         batch = shard_batch(batch, n_devices)
 
+        batch_start = time.time()
         score = infer(params, batch)  # [dev, perB, 1]
         score = np.array(score).reshape(-1)
+        batch_time = time.time() - batch_start
+        total_infer_time += batch_time
 
         all_scores.append(score)
         all_targets.append(batch_np["target"].reshape(-1))
+        total_samples += batch_np["target"].shape[0]
 
     scores = np.concatenate(all_scores, axis=0)
     targets = np.concatenate(all_targets, axis=0)
 
     results = tar_at_far(scores, targets, args.far_list)
+    eer, eer_thr = compute_eer(scores, targets)
 
     print("\nTAR@FAR results:")
     for FAR, thr, TAR in results:
@@ -172,6 +207,15 @@ def main():
             print(f"  FAR={FAR:.1e}: not enough negatives")
         else:
             print(f"  FAR={FAR:.1e}: thr={thr:.4f}, TAR={TAR:.4f}")
+
+    if eer is None:
+        print("EER: not enough positive/negative samples")
+    else:
+        print(f"EER: {eer*100:.2f}% at thr={eer_thr:.4f}")
+
+    if total_infer_time > 0 and total_samples > 0:
+        print(f"Inference time: {total_infer_time:.2f}s total "
+              f"({total_samples/total_infer_time:.2f} samples/sec)")
 
 
 if __name__ == "__main__":
