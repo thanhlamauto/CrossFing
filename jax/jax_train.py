@@ -106,7 +106,7 @@ def binary_focal_loss(pred: jnp.ndarray,
 def inbatch_ranking_loss(score: jnp.ndarray,
                          target: jnp.ndarray,
                          margin: float = 0.2,
-                         key: jax.random.KeyArray = None) -> jnp.ndarray:
+                         key: Any = None) -> jnp.ndarray:
     """
     Random in-batch ranking loss.
     """
@@ -243,7 +243,7 @@ def make_train_step(config, is_tpu=False):
                    batch: dict,
                    fusion_alpha: float,
                    ranking_weight: float,
-                   rng: jax.random.KeyArray):
+                   rng: Any):
         """
         Single train step running on each device.
         """
