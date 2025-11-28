@@ -29,13 +29,30 @@ def shard_batch(batch, n_devices):
 def parse_args():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", type=str,
-                        default="jax_config_sd300.yaml")
+                        default="jax_config_sd300.yaml",
+                        help="YAML config file (relative paths are resolved against jax/)")
     parser.add_argument("--test_npy", type=str,
-                        required=True)
+                        required=True,
+                        help="Path to npy file that contains info_lst for evaluation")
+    parser.add_argument("--data_root", type=str,
+                        default=None,
+                        help="Optional root dir to prepend to relative image paths")
     parser.add_argument("--ckpt_dir", type=str,
-                        required=True)
+                        required=True,
+                        help="Directory that contains Flax checkpoints (e.g. saved_jax_fvc)")
+    parser.add_argument("--ckpt_step", type=int,
+                        default=None,
+                        help="Specific checkpoint step to restore (e.g. 40). "
+                             "If None, the latest checkpoint will be used.")
+    parser.add_argument("--global_batch", type=int,
+                        default=64,
+                        help="Global batch size for evaluation (must be divisible by #devices)")
     parser.add_argument("--max_batches", type=int,
-                        default=None)
+                        default=None,
+                        help="Optional limit on number of batches to evaluate")
+    parser.add_argument("--far_list", type=float, nargs="+",
+                        default=[1e-1, 1e-2, 1e-3, 1e-4],
+                        help="FAR values to report TAR for")
     return parser.parse_args()
 
 
@@ -60,7 +77,16 @@ def tar_at_far(scores, targets, far_list=(1e-1, 1e-2, 1e-3, 1e-4)):
 
 def main():
     args = parse_args()
-    with open(args.config, "r") as f:
+
+    # Resolve config path relative to this script if needed
+    config_path = args.config
+    if not os.path.isabs(config_path) and not os.path.exists(config_path):
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        alt = os.path.join(script_dir, config_path)
+        if os.path.exists(alt):
+            config_path = alt
+
+    with open(config_path, "r") as f:
         cfg = yaml.safe_load(f)
 
     n_devices = jax.device_count()
@@ -82,7 +108,11 @@ def main():
     params = variables["params"]
 
     # restore ckpt
-    params = checkpoints.restore_checkpoint(args.ckpt_dir, target=params)
+    ckpt_dir = args.ckpt_dir
+    if args.ckpt_step is not None:
+        ckpt_dir = os.path.join(ckpt_dir, f"checkpoint_{args.ckpt_step}")
+    print(f"Restoring checkpoint from: {ckpt_dir}")
+    params = checkpoints.restore_checkpoint(ckpt_dir, target=params)
     params = jax_utils.replicate(params)  # replicate for pmap
 
     # pmap infer
@@ -95,14 +125,23 @@ def main():
         return score
 
     test_info = read_pair_list(args.test_npy)
+    print(f"Loaded {len(test_info)} eval pairs from {args.test_npy}")
 
-    global_batch = 32
-    assert global_batch % n_devices == 0
+    global_batch = args.global_batch
+    if global_batch % n_devices != 0:
+        new_batch = n_devices * max(1, global_batch // n_devices)
+        print(f"Adjusting global_batch from {global_batch} to {new_batch} "
+              f"to be divisible by {n_devices} devices")
+        global_batch = new_batch
+
+    print(f"Global batch: {global_batch}  (per-device: {global_batch // n_devices})")
+
     gen = pair_generator(test_info, batch_size=global_batch,
                          input_size=input_size,
                          use_augmentation=False,
                          use_mask=True,
-                         shuffle=False)
+                         shuffle=False,
+                         data_root=args.data_root)
 
     steps = len(test_info) // global_batch + int(len(test_info) % global_batch > 0)
 
@@ -125,8 +164,7 @@ def main():
     scores = np.concatenate(all_scores, axis=0)
     targets = np.concatenate(all_targets, axis=0)
 
-    far_list = [1e-1, 1e-2, 1e-3, 1e-4]
-    results = tar_at_far(scores, targets, far_list)
+    results = tar_at_far(scores, targets, args.far_list)
 
     print("\nTAR@FAR results:")
     for FAR, thr, TAR in results:
