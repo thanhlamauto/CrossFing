@@ -319,15 +319,36 @@ def main():
     if args.use_wandb:
         try:
             import wandb
+            
+            # Set API key from environment if available (for Kaggle)
+            # On Kaggle, set it via: os.environ['WANDB_API_KEY'] = your_key
+            # Or use kaggle_secrets: 
+            #   from kaggle_secrets import UserSecretsClient
+            #   user_secrets = UserSecretsClient()
+            #   os.environ['WANDB_API_KEY'] = user_secrets.get_secret("wandb_api_key")
+            
+            # Try to login if API key is set, but don't fail if it doesn't work
+            if 'WANDB_API_KEY' in os.environ:
+                try:
+                    wandb.login(key=os.environ['WANDB_API_KEY'], relogin=True)
+                except Exception as e:
+                    print(f"Warning: wandb.login() failed (this is OK if key is already set): {e}")
+            
             wandb_run = wandb.init(
                 project=args.wandb_project,
                 name=args.wandb_run_name,
-                config={"args": vars(args), "is_tpu": is_tpu, "n_devices": n_devices}
+                config={"args": vars(args), "is_tpu": is_tpu, "n_devices": n_devices},
+                settings=wandb.Settings(_disable_stats=True)  # Disable stats collection on Kaggle
             )
             print(f"Wandb initialized: {wandb_run.url}")
         except ImportError:
             print("Warning: wandb not installed, skipping wandb logging")
             args.use_wandb = 0
+        except Exception as e:
+            print(f"Warning: wandb initialization failed: {e}")
+            print("Continuing without wandb logging...")
+            args.use_wandb = 0
+            wandb_run = None
 
     # Handle config path - if relative, look in jax/ directory
     config_path = args.config
