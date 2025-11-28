@@ -123,20 +123,40 @@ def inbatch_ranking_loss(score: jnp.ndarray,
     n_pos = jnp.sum(pos_mask)
     n_neg = jnp.sum(neg_mask)
 
+    # Use where to extract values instead of boolean indexing
+    # This works better with JAX's tracing
     def _no_pos_neg():
         return jnp.array(0.0, dtype=jnp.float32)
 
     def _compute():
-        pos_scores = score[pos_mask]
-        neg_scores = score[neg_mask]
-        idx = jax.random.randint(key, (pos_scores.shape[0],),
-                                 minval=0, maxval=neg_scores.shape[0])
+        # Use jnp.where to extract positive and negative scores
+        # This avoids boolean indexing issues in jax.lax.cond
+        pos_scores = jnp.where(pos_mask, score, jnp.nan)
+        neg_scores = jnp.where(neg_mask, score, jnp.nan)
+        
+        # Filter out NaN values using compress
+        pos_scores = jnp.compress(pos_mask, score)
+        neg_scores = jnp.compress(neg_mask, score)
+        
+        # Random sampling
+        n_pos_actual = pos_scores.shape[0]
+        n_neg_actual = neg_scores.shape[0]
+        
+        if n_pos_actual == 0 or n_neg_actual == 0:
+            return jnp.array(0.0, dtype=jnp.float32)
+        
+        # Sample random negative for each positive
+        idx = jax.random.randint(key, (n_pos_actual,),
+                                 minval=0, maxval=n_neg_actual)
         neg_sampled = neg_scores[idx]
+        
+        # Compute ranking loss
         loss = jnp.maximum(0.0, margin - pos_scores + neg_sampled)
         return jnp.mean(loss)
 
-    return jax.lax.cond((n_pos > 0) & (n_neg > 0),
-                        _compute, _no_pos_neg)
+    # Check if we have both positives and negatives
+    has_both = (n_pos > 0) & (n_neg > 0)
+    return jax.lax.cond(has_both, _compute, _no_pos_neg)
 
 
 # ---------- TrainState ----------
