@@ -192,19 +192,17 @@ class CrossAttentionBlock(nn.Module):
         y_q = nn.LayerNorm(dtype=self.dtype, param_dtype=jnp.float32)(x_q)
         y_kv = nn.LayerNorm(dtype=self.dtype, param_dtype=jnp.float32)(x_kv)
 
-        bias = None
+        mask = None
         if mask_k is not None:
             mask_k = mask_k.astype(jnp.float32)
-            large_neg = -1e4
-            bias = (1.0 - mask_k) * large_neg  # [B,Nk]
-            bias = bias[:, None, None, :]  # [B,1,1,Nk]
+            mask = mask_k[:, None, None, :] > 0.5
 
         y = nn.MultiHeadDotProductAttention(
             num_heads=self.num_heads,
             deterministic=True,
             dtype=self.dtype,
             param_dtype=self.dtype,
-        )(y_q, y_kv, attention_bias=bias)
+        )(y_q, y_kv, mask=mask)
 
         x_q = x_q + y
         x_q = x_q + MLPBlock(hidden_dim=4 * x_q.shape[-1], dtype=self.dtype)(
