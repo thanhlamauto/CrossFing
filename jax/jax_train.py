@@ -2,9 +2,13 @@
 # Optimized for TPU v5e-8 on Kaggle
 import argparse
 import os
+import sys
 import time
 import functools
 from typing import Any
+
+# Add current directory to path for imports
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 
 import jax
 import jax.numpy as jnp
@@ -285,7 +289,16 @@ def main():
             print("Warning: wandb not installed, skipping wandb logging")
             args.use_wandb = 0
 
-    with open(args.config, "r") as f:
+    # Handle config path - if relative, look in jax/ directory
+    config_path = args.config
+    if not os.path.isabs(config_path) and not os.path.exists(config_path):
+        # Try in the same directory as this script
+        script_dir = os.path.dirname(os.path.abspath(__file__))
+        alt_path = os.path.join(script_dir, config_path)
+        if os.path.exists(alt_path):
+            config_path = alt_path
+    
+    with open(config_path, "r") as f:
         config = yaml.safe_load(f)
 
     # Adjust batch size for TPU (should be divisible by n_devices)
