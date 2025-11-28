@@ -109,7 +109,7 @@ def inbatch_ranking_loss(score: jnp.ndarray,
                          key: Any = None) -> jnp.ndarray:
     """
     Random in-batch ranking loss.
-    Avoids boolean indexing inside cond by using a simpler approach.
+    Fixed to avoid boolean indexing issues in JAX.
     """
     if key is None:
         key = jax.random.PRNGKey(0)
@@ -118,53 +118,55 @@ def inbatch_ranking_loss(score: jnp.ndarray,
     score = score.astype(jnp.float32).squeeze(-1)
     target = target.astype(jnp.float32).squeeze(-1)
 
-    pos_mask = (target == 1.0).astype(jnp.float32)
-    neg_mask = (target == 0.0).astype(jnp.float32)
+    pos_mask = (target == 1.0)
+    neg_mask = (target == 0.0)
 
-    n_pos = jnp.sum(pos_mask)
-    n_neg = jnp.sum(neg_mask)
+    n_pos = jnp.sum(pos_mask.astype(jnp.float32))
+    n_neg = jnp.sum(neg_mask.astype(jnp.float32))
 
-    # Early return if no positives or negatives
-    # Use a safe computation that returns 0 when invalid
-    def _compute_loss():
-        # Get indices of positives and negatives
-        batch_size = score.shape[0]
-        indices = jnp.arange(batch_size)
-        
-        # For each positive, sample a random negative
-        # We'll use a simpler approach: pair each positive with a random negative
-        pos_indices = jnp.where(pos_mask > 0.5, indices, -1)
-        neg_indices = jnp.where(neg_mask > 0.5, indices, -1)
-        
-        # Count actual positives and negatives
-        n_pos_actual = jnp.sum(pos_mask)
-        n_neg_actual = jnp.sum(neg_mask)
-        
-        # If no positives or negatives, return 0
-        safe_n_pos = jnp.maximum(n_pos_actual, 1.0)  # Avoid division by zero
-        safe_n_neg = jnp.maximum(n_neg_actual, 1.0)
-        
-        # Sample random negative indices for each positive
-        # Use modulo to ensure valid indices
-        random_neg_idx = jax.random.randint(key, (batch_size,),
-                                             minval=0, maxval=batch_size)
-        random_neg_idx = random_neg_idx % jnp.maximum(n_neg_actual.astype(jnp.int32), 1)
-        
-        # Get scores using gather (safer than boolean indexing)
-        # For positives: get their scores
-        pos_scores = jnp.sum(score * pos_mask) / safe_n_pos
-        
-        # For negatives: sample one per positive
-        # Simplified: use mean of negatives weighted by random selection
-        neg_scores_sampled = jnp.sum(score * neg_mask) / safe_n_neg
-        
-        # Compute loss (simplified version)
-        loss = jnp.maximum(0.0, margin - pos_scores + neg_scores_sampled)
-        
-        # Return 0 if no valid pairs
-        return loss * (n_pos_actual > 0) * (n_neg_actual > 0)
-
-    return _compute_loss()
+    # If no positives or negatives, return 0
+    has_both = (n_pos > 0) & (n_neg > 0)
+    
+    # Compute loss for all pairs, then mask
+    batch_size = score.shape[0]
+    
+    # Expand to [batch, batch] for pairwise comparison
+    pos_scores_expanded = jnp.expand_dims(score, 0)  # [1, B]
+    neg_scores_expanded = jnp.expand_dims(score, 1)  # [B, 1]
+    
+    # Compute ranking loss for all pairs
+    # loss[i,j] = max(0, margin - pos[i] + neg[j])
+    # But we only want pairs where i is positive and j is negative
+    pairwise_loss = jnp.maximum(0.0, margin - pos_scores_expanded + neg_scores_expanded)
+    
+    # Mask: only keep pairs where first is positive and second is negative
+    valid_mask = jnp.expand_dims(pos_mask.astype(jnp.float32), 0) * \
+                 jnp.expand_dims(neg_mask.astype(jnp.float32), 1)
+    
+    # Sample one negative per positive using random selection
+    # For each positive, pick a random negative
+    neg_indices = jnp.where(neg_mask, jnp.arange(batch_size), -1)
+    pos_indices = jnp.where(pos_mask, jnp.arange(batch_size), -1)
+    
+    # Sample random negative index for each position
+    random_idx = jax.random.randint(key, (batch_size,), minval=0, maxval=batch_size)
+    
+    # Get the sampled negative scores
+    # Use gather with the random indices, but only for valid negatives
+    neg_scores_all = jnp.where(neg_mask, score, 0.0)
+    sampled_neg_scores = neg_scores_all[random_idx % batch_size]
+    
+    # Compute loss: margin - pos_score + sampled_neg_score
+    # Only for positions that are positive
+    loss_per_pos = jnp.maximum(0.0, margin - score + sampled_neg_scores)
+    loss_per_pos = loss_per_pos * pos_mask.astype(jnp.float32)
+    
+    # Average over positives
+    total_loss = jnp.sum(loss_per_pos)
+    avg_loss = total_loss / jnp.maximum(n_pos, 1.0)
+    
+    # Return 0 if no valid pairs
+    return avg_loss * has_both.astype(jnp.float32)
 
 
 # ---------- TrainState ----------
