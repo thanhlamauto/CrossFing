@@ -8,7 +8,9 @@ import functools
 from typing import Any
 
 # Add current directory to path for imports
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+_script_dir = os.path.dirname(os.path.abspath(__file__))
+if _script_dir not in sys.path:
+    sys.path.insert(0, _script_dir)
 
 import jax
 import jax.numpy as jnp
@@ -19,8 +21,46 @@ from flax.training import train_state, checkpoints
 from flax import jax_utils
 from flax.jax_utils import prefetch_to_device
 
-from jax_models import JIPNetFullFlax
-from jax_data import read_pair_list, pair_generator
+# Import using importlib to ensure we get the correct file
+import importlib.util
+
+# Load jax_models with error handling
+_models_path = os.path.join(_script_dir, "jax_models.py")
+if not os.path.exists(_models_path):
+    raise FileNotFoundError(f"jax_models.py not found at {_models_path}")
+
+try:
+    spec_models = importlib.util.spec_from_file_location("jax_models", _models_path)
+    jax_models = importlib.util.module_from_spec(spec_models)
+    spec_models.loader.exec_module(jax_models)
+    
+    if not hasattr(jax_models, 'JIPNetFullFlax'):
+        raise AttributeError(
+            f"JIPNetFullFlax not found in jax_models. Available: {[x for x in dir(jax_models) if not x.startswith('_')]}"
+        )
+    JIPNetFullFlax = jax_models.JIPNetFullFlax
+except Exception as e:
+    print(f"Error loading jax_models from {_models_path}:")
+    import traceback
+    traceback.print_exc()
+    raise
+
+# Load jax_data
+_data_path = os.path.join(_script_dir, "jax_data.py")
+if not os.path.exists(_data_path):
+    raise FileNotFoundError(f"jax_data.py not found at {_data_path}")
+
+try:
+    spec_data = importlib.util.spec_from_file_location("jax_data", _data_path)
+    jax_data = importlib.util.module_from_spec(spec_data)
+    spec_data.loader.exec_module(jax_data)
+    read_pair_list = jax_data.read_pair_list
+    pair_generator = jax_data.pair_generator
+except Exception as e:
+    print(f"Error loading jax_data from {_data_path}:")
+    import traceback
+    traceback.print_exc()
+    raise
 
 
 # ---------- TPU/Device Setup ----------
