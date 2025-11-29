@@ -103,7 +103,7 @@ def binary_focal_loss(pred: jnp.ndarray,
     return jnp.mean(focal)
 
 
-def inbatch_ranking_loss(score, target, margin=0.2, topk=1):
+def inbatch_ranking_loss(score, target, margin=0.2, topk=1, key=None):
     score = score.astype(jnp.float32).squeeze(-1)
     target = target.astype(jnp.float32).squeeze(-1)
 
