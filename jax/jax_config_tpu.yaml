@@ -1,21 +1,30 @@
-# TPU v5e-8 optimized config
-# 8 TPU chips = batch should be divisible by 8
-# Larger batches = better TPU utilization
+# TPU v5e-8 optimized config (revised)
 
 train_cfg:
   lr: 5.0e-4
   epochs: 60
-  batch_size: 128  # 128 / 8 = 16 per TPU chip (good utilization)
-  
+  batch_size: 128            # vẫn TPU-friendly (divisible by 8)
+
   warmup_epochs: 5
-  warmup_steps: 500  # LR warmup steps
+  warmup_steps: 500
   fusion_alpha_warm: 0.8
-  hard_negative_start_epoch: 45
+
+  # bật hard negative sớm hơn để tránh plateau lâu ở B
+  hard_negative_start_epoch: 25
 
   use_ranking_loss: true
-  ranking_margin: 0.2
-  ranking_weight_phaseB: 0.3
-  ranking_weight_phaseC: 0.5
+
+  # margin schedule: dễ -> khó dần
+  ranking_margin: 0.2        # m0 lúc đầu (và trong warmup)
+  ranking_margin_B: 0.30     # target margin cuối phase B
+  ranking_margin_C: 0.45     # target margin cuối phase C
+
+  # rank_w schedule: tăng mượt
+  ranking_weight_phaseB: 0.25   # max cuối phase B (rank_w sẽ ramp 0 -> 0.25)
+  ranking_weight_phaseC: 0.60   # max cuối phase C (ramp 0.25 -> 0.60)
+
+  # hard in-batch ranking
+  ranking_topk: 5            # lấy mean top-3 hardest negatives (ổn định)
 
 model_cfg:
   input_size: 320
@@ -23,4 +32,3 @@ model_cfg:
   global_hidden_dim: 512
   transformer_layers: 6
   transformer_heads: 8
-

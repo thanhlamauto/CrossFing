@@ -106,14 +106,13 @@ def binary_focal_loss(pred: jnp.ndarray,
 def inbatch_ranking_loss(score: jnp.ndarray,
                          target: jnp.ndarray,
                          margin: float = 0.2,
-                         key: Any = None) -> jnp.ndarray:
+                         key: Any = None,
+                         topk: int = 1) -> jnp.ndarray:
     """
-    Random in-batch ranking loss.
-    Fixed to avoid boolean indexing issues in JAX.
+    Hard / top-k in-batch ranking loss.
+    score: [B,1] or [B]
+    target: [B,1] or [B]
     """
-    if key is None:
-        key = jax.random.PRNGKey(0)
-
     # Cast to float32 for loss computation
     score = score.astype(jnp.float32).squeeze(-1)
     target = target.astype(jnp.float32).squeeze(-1)
@@ -121,52 +120,64 @@ def inbatch_ranking_loss(score: jnp.ndarray,
     pos_mask = (target == 1.0)
     neg_mask = (target == 0.0)
 
-    n_pos = jnp.sum(pos_mask.astype(jnp.float32))
-    n_neg = jnp.sum(neg_mask.astype(jnp.float32))
+    pos_scores = score * pos_mask
+    neg_scores = score * neg_mask
 
-    # If no positives or negatives, return 0
+    n_pos = jnp.sum(pos_mask)
+    n_neg = jnp.sum(neg_mask)
     has_both = (n_pos > 0) & (n_neg > 0)
-    
-    # Compute loss for all pairs, then mask
-    batch_size = score.shape[0]
-    
-    # Expand to [batch, batch] for pairwise comparison
-    pos_scores_expanded = jnp.expand_dims(score, 0)  # [1, B]
-    neg_scores_expanded = jnp.expand_dims(score, 1)  # [B, 1]
-    
-    # Compute ranking loss for all pairs
-    # loss[i,j] = max(0, margin - pos[i] + neg[j])
-    # But we only want pairs where i is positive and j is negative
-    pairwise_loss = jnp.maximum(0.0, margin - pos_scores_expanded + neg_scores_expanded)
-    
-    # Mask: only keep pairs where first is positive and second is negative
-    valid_mask = jnp.expand_dims(pos_mask.astype(jnp.float32), 0) * \
-                 jnp.expand_dims(neg_mask.astype(jnp.float32), 1)
-    
-    # Sample one negative per positive using random selection
-    # For each positive, pick a random negative
-    neg_indices = jnp.where(neg_mask, jnp.arange(batch_size), -1)
-    pos_indices = jnp.where(pos_mask, jnp.arange(batch_size), -1)
-    
-    # Sample random negative index for each position
-    random_idx = jax.random.randint(key, (batch_size,), minval=0, maxval=batch_size)
-    
-    # Get the sampled negative scores
-    # Use gather with the random indices, but only for valid negatives
-    neg_scores_all = jnp.where(neg_mask, score, 0.0)
-    sampled_neg_scores = neg_scores_all[random_idx % batch_size]
-    
-    # Compute loss: margin - pos_score + sampled_neg_score
-    # Only for positions that are positive
-    loss_per_pos = jnp.maximum(0.0, margin - score + sampled_neg_scores)
-    loss_per_pos = loss_per_pos * pos_mask.astype(jnp.float32)
-    
-    # Average over positives
-    total_loss = jnp.sum(loss_per_pos)
-    avg_loss = total_loss / jnp.maximum(n_pos, 1.0)
-    
-    # Return 0 if no valid pairs
-    return avg_loss * has_both.astype(jnp.float32)
+
+    def zero():
+        return jnp.array(0.0, dtype=jnp.float32)
+
+    def compute():
+        # All negative scores [Nneg]
+        neg_vals = neg_scores[neg_mask]
+        k = jnp.minimum(topk, neg_vals.shape[0])
+        # Top-k hardest negatives
+        top_neg = jnp.sort(neg_vals)[-k:]  # [k]
+        s_neg = jnp.mean(top_neg)
+
+        pos_vals = pos_scores[pos_mask]  # [Npos]
+        loss_pos = jnp.maximum(0.0, margin + s_neg - pos_vals)
+        return jnp.mean(loss_pos)
+
+    return jax.lax.cond(has_both, compute, zero)
+
+
+def get_rank_weight(epoch: int,
+                    warmup_epochs: int,
+                    hard_start: int,
+                    total_epochs: int,
+                    wB: float,
+                    wC: float) -> float:
+    """Smooth schedule for ranking weight."""
+    if epoch < warmup_epochs:
+        return 0.0
+    if epoch < hard_start:
+        t = (epoch - warmup_epochs) / max(1, hard_start - warmup_epochs)
+        return float(t * wB)
+    else:
+        t = (epoch - hard_start) / max(1, total_epochs - hard_start)
+        return float(wB + t * (wC - wB))
+
+
+def get_margin(epoch: int,
+               warmup_epochs: int,
+               hard_start: int,
+               total_epochs: int,
+               m0: float = 0.2,
+               mB: float = 0.3,
+               mC: float = 0.45) -> float:
+    """Smooth schedule for ranking margin."""
+    if epoch < warmup_epochs:
+        return float(m0)
+    if epoch < hard_start:
+        t = (epoch - warmup_epochs) / max(1, hard_start - warmup_epochs)
+        return float(m0 + t * (mB - m0))
+    else:
+        t = (epoch - hard_start) / max(1, total_epochs - hard_start)
+        return float(mB + t * (mC - mB))
 
 
 # ---------- Eval helpers ----------
@@ -422,13 +433,14 @@ def data_iterator_with_prefetch(data_gen, n_devices, prefetch_size=2, is_tpu=Fal
 def make_train_step(config, is_tpu=False):
     """Create pmapped train step function."""
     
-    margin = config["train_cfg"]["ranking_margin"]
+    topk = config["train_cfg"].get("ranking_topk", 1)
     dtype = jnp.bfloat16 if is_tpu else jnp.float32
 
     def train_step(state: TrainState,
                    batch: dict,
                    fusion_alpha: float,
                    ranking_weight: float,
+                   margin: float,
                    rng: Any):
         """
         Single train step running on each device.
@@ -443,7 +455,7 @@ def make_train_step(config, is_tpu=False):
             # Compute losses in float32 for stability
             focal = binary_focal_loss(score, batch["target"])
             rank = inbatch_ranking_loss(score, batch["target"],
-                                        margin=margin, key=rng)
+                                        margin=margin, key=rng, topk=topk)
             loss = focal + ranking_weight * rank
             return loss, (focal, rank, score)
 
@@ -469,8 +481,12 @@ def make_train_step(config, is_tpu=False):
 
     # donate_argnums=(0,) tells JAX it can reuse the memory of state
     # static_broadcasted_argnums marks scalar arguments that don't need to be mapped
-    return jax.pmap(train_step, axis_name="dev", donate_argnums=(0,), 
-                    static_broadcasted_argnums=(2, 3))  # fusion_alpha and ranking_weight are static
+    return jax.pmap(
+        train_step,
+        axis_name="dev",
+        donate_argnums=(0,),
+        static_broadcasted_argnums=(2, 3, 4),  # fusion_alpha, ranking_weight, margin are static
+    )
 
 
 def parse_args():
@@ -603,19 +619,32 @@ def main():
     for epoch in range(num_epochs):
         epoch_start_time = time.time()
         
-        # Phase schedule
+        # Phase schedule + smooth rank weight
         if epoch < warmup_epochs:
             phase = "A_warmup"
             fusion_alpha = fusion_alpha_warm
-            rank_w = 0.0
-        elif epoch < hard_start:
-            phase = "B_refine"
-            fusion_alpha = fusion_alpha_norm
-            rank_w = wB if use_ranking else 0.0
         else:
-            phase = "C_hardneg"
             fusion_alpha = fusion_alpha_norm
-            rank_w = wC if use_ranking else 0.0
+            phase = "B_refine" if epoch < hard_start else "C_hardneg"
+
+        rank_w = get_rank_weight(
+            epoch,
+            warmup_epochs,
+            hard_start,
+            num_epochs,
+            wB if use_ranking else 0.0,
+            wC if use_ranking else 0.0,
+        )
+
+        margin_epoch = get_margin(
+            epoch,
+            warmup_epochs,
+            hard_start,
+            num_epochs,
+            m0=config["train_cfg"]["ranking_margin"],
+            mB=config["train_cfg"].get("ranking_margin_B", 0.3),
+            mC=config["train_cfg"].get("ranking_margin_C", 0.45),
+        )
 
         print(f"\nEpoch {epoch}/{num_epochs} phase={phase} "
               f"alpha={fusion_alpha:.2f} rank_w={rank_w:.2f}")
@@ -649,9 +678,14 @@ def main():
             rng, step_key = jax.random.split(rng)
             step_keys = jax.random.split(step_key, n_devices)
 
-            state, metrics = p_train_step(state, batch,
-                                          fusion_alpha, rank_w,
-                                          step_keys)
+            state, metrics = p_train_step(
+                state,
+                batch,
+                fusion_alpha,
+                rank_w,
+                margin_epoch,
+                step_keys,
+            )
 
             # Block until computation is done (for accurate timing)
             jax.tree_util.tree_map(lambda x: x.block_until_ready(), metrics)
@@ -685,7 +719,7 @@ def main():
 
         epoch_time = time.time() - epoch_start_time
         avg_step_time = np.mean(step_times)
-        
+
         print(f"Epoch {epoch} DONE: loss={epoch_loss:.4f} "
               f"focal={epoch_focal:.4f} rank={epoch_rank:.4f} "
               f"({epoch_time:.1f}s, {global_batch/avg_step_time:.1f} samples/sec avg)")
