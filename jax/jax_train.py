@@ -103,25 +103,12 @@ def binary_focal_loss(pred: jnp.ndarray,
     return jnp.mean(focal)
 
 
-def inbatch_ranking_loss(score: jnp.ndarray,
-                         target: jnp.ndarray,
-                         margin: float = 0.2,
-                         key: Any = None,
-                         topk: int = 1) -> jnp.ndarray:
-    """
-    Hard / top-k in-batch ranking loss.
-    score: [B,1] or [B]
-    target: [B,1] or [B]
-    """
-    # Cast to float32 for loss computation
+def inbatch_ranking_loss(score, target, margin=0.2, topk=1):
     score = score.astype(jnp.float32).squeeze(-1)
     target = target.astype(jnp.float32).squeeze(-1)
 
     pos_mask = (target == 1.0)
     neg_mask = (target == 0.0)
-
-    pos_scores = score * pos_mask
-    neg_scores = score * neg_mask
 
     n_pos = jnp.sum(pos_mask)
     n_neg = jnp.sum(neg_mask)
@@ -131,23 +118,25 @@ def inbatch_ranking_loss(score: jnp.ndarray,
         return jnp.array(0.0, dtype=jnp.float32)
 
     def compute():
-        # All negative scores, use very small value for non-negatives
         large_neg = -1e6
-        neg_vals_all = jnp.where(neg_mask, score, large_neg)
-        # Sort and take top-k hardest negatives
-        neg_sorted = jnp.sort(neg_vals_all)  # ascending
-        k = jnp.minimum(topk, neg_sorted.shape[0])
-        top_neg = neg_sorted[-k:]  # [k]
-        # HARD: use max of hardest negatives (batch-hard)
+        # Put a very low value on non-negatives so they sink in top_k
+        neg_vals_all = jnp.where(neg_mask, score, large_neg)  # [B]
+
+        # JAX-safe: use lax.top_k with STATIC topk (no dynamic slicing)
+        k = int(topk)
+        k = max(1, k)
+        k = min(k, neg_vals_all.shape[0])  # shape[0] is static
+        top_neg, _ = jax.lax.top_k(neg_vals_all, k)  # [k]
         s_neg = jnp.max(top_neg)
 
-        # Positive scores: zero out non-positives, then average loss over positives
         pos_vals_all = jnp.where(pos_mask, score, 0.0)
         loss_pos = jnp.maximum(0.0, margin + s_neg - pos_vals_all)
-        # Normalize by number of positives
+        loss_pos = loss_pos * pos_mask.astype(jnp.float32)
+
         return jnp.sum(loss_pos) / jnp.maximum(n_pos, 1.0)
 
     return jax.lax.cond(has_both, compute, zero)
+
 
 
 def get_rank_weight(epoch: int,
