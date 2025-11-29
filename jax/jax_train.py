@@ -131,16 +131,21 @@ def inbatch_ranking_loss(score: jnp.ndarray,
         return jnp.array(0.0, dtype=jnp.float32)
 
     def compute():
-        # All negative scores [Nneg]
-        neg_vals = neg_scores[neg_mask]
-        k = jnp.minimum(topk, neg_vals.shape[0])
-        # Top-k hardest negatives
-        top_neg = jnp.sort(neg_vals)[-k:]  # [k]
-        s_neg = jnp.mean(top_neg)
+        # All negative scores, use very small value for non-negatives
+        large_neg = -1e6
+        neg_vals_all = jnp.where(neg_mask, score, large_neg)
+        # Sort and take top-k hardest negatives
+        neg_sorted = jnp.sort(neg_vals_all)  # ascending
+        k = jnp.minimum(topk, neg_sorted.shape[0])
+        top_neg = neg_sorted[-k:]  # [k]
+        # HARD: use max of hardest negatives (batch-hard)
+        s_neg = jnp.max(top_neg)
 
-        pos_vals = pos_scores[pos_mask]  # [Npos]
-        loss_pos = jnp.maximum(0.0, margin + s_neg - pos_vals)
-        return jnp.mean(loss_pos)
+        # Positive scores: zero out non-positives, then average loss over positives
+        pos_vals_all = jnp.where(pos_mask, score, 0.0)
+        loss_pos = jnp.maximum(0.0, margin + s_neg - pos_vals_all)
+        # Normalize by number of positives
+        return jnp.sum(loss_pos) / jnp.maximum(n_pos, 1.0)
 
     return jax.lax.cond(has_both, compute, zero)
 
